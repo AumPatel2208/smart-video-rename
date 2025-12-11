@@ -11,6 +11,7 @@ This tool processes videos in a directory:
 """
 
 import argparse
+import csv
 import json
 import os
 import shutil
@@ -44,6 +45,19 @@ class VideoMetadata(BaseModel):
     tags: List[str] = Field(
         description="3-7 relevant keyword tags for categorization"
     )
+    # Slate detection fields (only populated when --detect-slate is used)
+    scene: Optional[str] = Field(
+        default=None,
+        description="Scene number/identifier from slate/clapperboard if visible"
+    )
+    shot: Optional[str] = Field(
+        default=None,
+        description="Shot number/identifier from slate/clapperboard if visible"
+    )
+    take: Optional[str] = Field(
+        default=None,
+        description="Take number from slate/clapperboard if visible"
+    )
 
 
 class OriginalMetadata(BaseModel):
@@ -69,6 +83,7 @@ class BackupLog(BaseModel):
     """Complete backup log for a processing session."""
     created_at: str
     source_directory: str
+    detect_slate: bool = False
     entries: List[VideoBackupEntry] = []
 
 
@@ -213,7 +228,7 @@ def restore_metadata(input_path: str, output_path: str,
 
 # ============ AI Analysis ============
 
-def analyze_video(proxy_path: str, client: genai.Client) -> VideoMetadata:
+def analyze_video(proxy_path: str, client: genai.Client, detect_slate: bool = False) -> VideoMetadata:
     """Analyze video with Gemini and return structured metadata."""
     uploaded_file = client.files.upload(file=proxy_path)
     
@@ -222,6 +237,8 @@ def analyze_video(proxy_path: str, client: genai.Client) -> VideoMetadata:
         time.sleep(5)
         print()
         uploaded_file = client.files.get(name=uploaded_file.name) 
+    
+    # Base prompt for video analysis
     prompt = """Analyze this video and provide metadata for organizing it.
 
 Based on the video content, provide:
@@ -239,25 +256,72 @@ Based on the video content, provide:
    - Location if identifiable
    - Category (travel, family, sports, tutorial, etc.)
    - Any notable people, objects, or events
-
-Respond with valid JSON only."""
-
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=[uploaded_file, prompt],
-        config={
-            "response_mime_type": "application/json",
-            "response_schema": VideoMetadata,
-        },
-    )
+"""
     
-    # Clean up uploaded file
-    try:
-        client.files.delete(name=uploaded_file.name)
-    except Exception:
-        pass
+    # Add slate detection instructions if enabled
+    if detect_slate:
+        prompt += """
+4. scene: Look at the first few seconds of the video for a slate/clapperboard.
+   - If visible, extract the Scene number/identifier
+   - If no slate is visible, set to null
+
+5. shot: From the slate/clapperboard if visible.
+   - Extract the Shot number/identifier
+   - If no slate is visible, set to null
+
+6. take: From the slate/clapperboard if visible.
+   - Extract the Take number
+   - If no slate is visible, set to null
+"""
     
-    return VideoMetadata.model_validate_json(response.text)
+    prompt += "\nRespond with valid JSON only."
+
+    # Retry logic for 503 UNAVAILABLE errors
+    max_retries = 3
+    retry_delay = 15  # seconds
+    
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[uploaded_file, prompt],
+                config={
+                    "response_mime_type": "application/json",
+                    "response_schema": VideoMetadata,
+                },
+            )
+            
+            # Clean up uploaded file
+            try:
+                client.files.delete(name=uploaded_file.name)
+            except Exception:
+                pass
+            
+            return VideoMetadata.model_validate_json(response.text)
+            
+        except Exception as e:
+            error_str = str(e)
+            # Check if it's a 503 UNAVAILABLE error
+            if '503' in error_str and 'UNAVAILABLE' in error_str:
+                if attempt < max_retries - 1:
+                    print(f"  Model overloaded, waiting {retry_delay} seconds before retry {attempt + 2}/{max_retries}...")
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    print(f"  Max retries reached. Model still overloaded.")
+                    # Clean up uploaded file before raising
+                    try:
+                        client.files.delete(name=uploaded_file.name)
+                    except Exception:
+                        pass
+                    raise
+            else:
+                # For other errors, clean up and raise immediately
+                try:
+                    client.files.delete(name=uploaded_file.name)
+                except Exception:
+                    pass
+                raise
 
 
 # ============ Backup/Restore Functions ============
@@ -329,11 +393,151 @@ def restore_from_backup(backup_path: Path, dry_run: bool = False) -> None:
     print("\nRestore complete!")
 
 
+# ============ DaVinci Resolve CSV Export ============
+
+# CSV column order matching DaVinci Resolve metadata format
+DAVINCI_CSV_COLUMNS = [
+    'File Name',
+    'Comments',
+    'Shot',
+    'Scene',
+    'Take',
+]
+
+
+def create_davinci_csv_filename(source_dir: Path) -> Path:
+    """Create a timestamped DaVinci CSV filename."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return source_dir / f"davinci_metadata_{timestamp}.csv"
+
+
+def format_date_modified(file_path: Path) -> str:
+    """Format file modification time in DaVinci Resolve format."""
+    try:
+        mtime = os.stat(file_path).st_mtime
+        dt = datetime.fromtimestamp(mtime)
+        return dt.strftime("%a %b %d %H:%M:%S %Y")
+    except (OSError, ValueError):
+        return ""
+
+
+def append_to_davinci_csv(entry: VideoBackupEntry, csv_path: Path, dry_run: bool = False) -> bool:
+    """Append a single entry to DaVinci Resolve CSV, creating file if needed.
+    
+    Args:
+        entry: Single VideoBackupEntry to append
+        csv_path: Path to CSV file
+        dry_run: If True, use backup timestamps instead of actual file stats
+        
+    Returns:
+        True if append was successful, False otherwise
+    """
+    try:
+        # Check if file exists to determine if we need to write header
+        file_exists = csv_path.exists()
+        
+        with open(csv_path, 'a', newline='', encoding='utf-8') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=DAVINCI_CSV_COLUMNS)
+            
+            # Write header if file is new
+            if not file_exists:
+                writer.writeheader()
+            
+            new_path = Path(entry.new_path)
+            
+            # Format comments as "Description: <desc>\nTags: <tags>"
+            tags_str = ', '.join(entry.new_metadata.tags)
+            comments = f"Description: {entry.new_metadata.description}\nTags: {tags_str}"
+            
+            # Get date modified from file or use processed_at timestamp
+            if not dry_run and new_path.exists():
+                date_modified = format_date_modified(new_path)
+            else:
+                # Use processed_at timestamp for dry run
+                try:
+                    dt = datetime.fromisoformat(entry.processed_at)
+                    date_modified = dt.strftime("%a %b %d %H:%M:%S %Y")
+                except ValueError:
+                    date_modified = ""
+            
+            # Build row with all columns (technical fields empty, slate from metadata)
+            row = {
+                'File Name': entry.new_filename,
+                'Comments': comments,
+                'Shot': entry.new_metadata.shot or '',
+                'Scene': entry.new_metadata.scene or '',
+                'Take': entry.new_metadata.take or '',
+            }
+            writer.writerow(row)
+        
+        return True
+    except Exception as e:
+        print(f"  Warning: Failed to update CSV: {e}")
+        return False
+
+
+def export_davinci_csv(backup: BackupLog, csv_path: Path, dry_run: bool = False) -> bool:
+    """Export backup entries to DaVinci Resolve compatible CSV.
+    
+    Args:
+        backup: BackupLog containing processed video entries
+        csv_path: Path to write CSV file
+        dry_run: If True, use backup timestamps instead of actual file stats
+        
+    Returns:
+        True if export was successful, False otherwise
+    """
+    if not backup.entries:
+        print("No entries to export to CSV")
+        return False
+    
+    try:
+        with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=DAVINCI_CSV_COLUMNS)
+            writer.writeheader()
+            
+            for entry in backup.entries:
+                new_path = Path(entry.new_path)
+                clip_directory = str(new_path.parent)
+                
+                # Format comments as "Description: <desc>\nTags: <tags>"
+                tags_str = ', '.join(entry.new_metadata.tags)
+                comments = f"Description: {entry.new_metadata.description}\nTags: {tags_str}"
+                
+                # Get date modified from file or use processed_at timestamp
+                if not dry_run and new_path.exists():
+                    date_modified = format_date_modified(new_path)
+                else:
+                    # Use processed_at timestamp for dry run
+                    try:
+                        dt = datetime.fromisoformat(entry.processed_at)
+                        date_modified = dt.strftime("%a %b %d %H:%M:%S %Y")
+                    except ValueError:
+                        date_modified = ""
+                
+                # Build row with all columns (technical fields empty, slate from metadata)
+                row = {
+                    'File Name': entry.new_filename,
+                    'Comments': comments,
+                    'Shot': entry.new_metadata.shot or '',
+                    'Scene': entry.new_metadata.scene or '',
+                    'Take': entry.new_metadata.take or '',
+                }
+                writer.writerow(row)
+        
+        return True
+    except Exception as e:
+        print(f"Error exporting CSV: {e}")
+        return False
+
+
 # ============ Video Processing ============
 
 def process_single_video(video_path: Path, output_dir: Path, 
                          client: genai.Client, dry_run: bool = False,
-                         max_proxy_size: float = 20.0) -> Optional[VideoBackupEntry]:
+                         max_proxy_size: float = 20.0,
+                         detect_slate: bool = False,
+                         csv_path: Optional[Path] = None) -> Optional[VideoBackupEntry]:
     """Process a single video file and return backup entry."""
     print(f"\nProcessing: {video_path.name}")
     
@@ -356,8 +560,10 @@ def process_single_video(video_path: Path, output_dir: Path,
         
         # Analyze with AI
         print("  Analyzing with AI...")
+        if detect_slate:
+            print("  (Slate detection enabled)")
         try:
-            new_metadata = analyze_video(proxy_path, client)
+            new_metadata = analyze_video(proxy_path, client, detect_slate)
         except Exception as e:
             print(f"  Error analyzing video: {e}")
             return None
@@ -379,7 +585,7 @@ def process_single_video(video_path: Path, output_dir: Path,
         
         if dry_run:
             print(f"  [DRY RUN] Would rename to: {new_filename}")
-            return VideoBackupEntry(
+            entry = VideoBackupEntry(
                 original_path=str(video_path),
                 original_filename=video_path.name,
                 new_path=str(new_path),
@@ -388,6 +594,10 @@ def process_single_video(video_path: Path, output_dir: Path,
                 new_metadata=new_metadata,
                 processed_at=datetime.now().isoformat()
             )
+            # Update CSV immediately after processing
+            if csv_path:
+                append_to_davinci_csv(entry, csv_path, dry_run)
+            return entry
         
         # Write metadata to temp file and move
         print(f"  Writing metadata...")
@@ -405,7 +615,7 @@ def process_single_video(video_path: Path, output_dir: Path,
             
             print(f"  Renamed to: {new_filename}")
             
-            return VideoBackupEntry(
+            entry = VideoBackupEntry(
                 original_path=str(video_path),
                 original_filename=video_path.name,
                 new_path=str(new_path),
@@ -414,6 +624,10 @@ def process_single_video(video_path: Path, output_dir: Path,
                 new_metadata=new_metadata,
                 processed_at=datetime.now().isoformat()
             )
+            # Update CSV immediately after processing
+            if csv_path:
+                append_to_davinci_csv(entry, csv_path, dry_run)
+            return entry
         else:
             print("  Error: Failed to write metadata")
             if os.path.exists(temp_output):
@@ -429,7 +643,9 @@ def process_single_video(video_path: Path, output_dir: Path,
 def process_videos(video_files: List[Path], output_dir: Path,
                    client: genai.Client, dry_run: bool = False,
                    parallel: bool = False, max_workers: int = 4,
-                   max_proxy_size: float = 20.0) -> List[VideoBackupEntry]:
+                   max_proxy_size: float = 20.0,
+                   detect_slate: bool = False,
+                   csv_path: Optional[Path] = None) -> List[VideoBackupEntry]:
     """Process multiple videos, optionally in parallel."""
     entries = []
     
@@ -440,7 +656,7 @@ def process_videos(video_files: List[Path], output_dir: Path,
             futures = {
                 executor.submit(
                     process_single_video, video_path, output_dir, 
-                    client, dry_run, max_proxy_size
+                    client, dry_run, max_proxy_size, detect_slate, csv_path
                 ): video_path
                 for video_path in video_files
             }
@@ -456,7 +672,7 @@ def process_videos(video_files: List[Path], output_dir: Path,
     else:
         for video_path in video_files:
             entry = process_single_video(video_path, output_dir, client, 
-                                         dry_run, max_proxy_size)
+                                         dry_run, max_proxy_size, detect_slate, csv_path)
             if entry:
                 entries.append(entry)
     
@@ -484,7 +700,12 @@ Examples:
   %(prog)s /path/to/videos                    # Process all videos in directory
   %(prog)s /path/to/videos --dry-run          # Preview changes without applying
   %(prog)s /path/to/videos --parallel         # Process videos in parallel
+  %(prog)s /path/to/videos --detect-slate     # Detect slate/clapperboard info
   %(prog)s --restore backup.json              # Restore from backup file
+
+Output:
+  - JSON backup file for restore capability
+  - DaVinci Resolve compatible CSV with metadata
         '''
     )
     
@@ -547,6 +768,13 @@ Examples:
         help='Maximum proxy file size in MB (default: 20)'
     )
     
+    # Slate detection
+    parser.add_argument(
+        '--detect-slate',
+        action='store_true',
+        help='Enable slate/clapperboard detection for Scene, Shot, Take fields'
+    )
+    
     return parser.parse_args()
 
 
@@ -594,16 +822,22 @@ def main():
     # Create backup log
     backup = BackupLog(
         created_at=datetime.now().isoformat(),
-        source_directory=str(input_dir)
+        source_directory=str(input_dir),
+        detect_slate=args.detect_slate
     )
     
-    # Process videos
+    # Create CSV path upfront
+    csv_path = create_davinci_csv_filename(output_dir)
+    
+    # Process videos (CSV updated incrementally during processing)
     entries = process_videos(
         video_files, output_dir, client,
         dry_run=args.dry_run,
         parallel=args.parallel,
         max_workers=args.workers,
-        max_proxy_size=args.max_proxy_size
+        max_proxy_size=args.max_proxy_size,
+        detect_slate=args.detect_slate,
+        csv_path=csv_path
     )
     
     backup.entries = entries
@@ -614,6 +848,10 @@ def main():
         save_backup(backup, backup_path)
         print(f"\nBackup saved to: {backup_path.name}")
         print(f"To restore: python video_rename.py --restore {backup_path}")
+        
+        # CSV was already updated incrementally during processing
+        if csv_path.exists():
+            print(f"DaVinci CSV saved to: {csv_path.name}")
     
     print(f"\nProcessed {len(entries)}/{len(video_files)} video(s) successfully")
     
