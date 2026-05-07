@@ -1,0 +1,129 @@
+name: CI & Release
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  # ── Run tests on every push / PR ──────────────────────────────────────────
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run tests
+        run: python -m pytest tests/
+
+  # ── Build installers only on version tags ─────────────────────────────────
+  build:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: SmartVideoRename-Linux.AppImage
+          - os: macos-latest
+            artifact: SmartVideoRename-macOS.dmg
+          - os: windows-latest
+            artifact: SmartVideoRename-Windows-Setup.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      # ── FFmpeg ──────────────────────────────────────────────────────────────
+      - name: Fetch FFmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: python scripts/fetch_ffmpeg.py
+
+      - name: Fetch FFmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install ffmpeg
+          mkdir -p bin
+          cp "$(brew --prefix)/bin/ffmpeg"  bin/ffmpeg
+          cp "$(brew --prefix)/bin/ffprobe" bin/ffprobe
+
+      - name: Fetch FFmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: python scripts/fetch_ffmpeg.py
+
+      # ── Linux system deps (for pywebview) ───────────────────────────────────
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            libgtk-3-dev libwebkit2gtk-4.0-dev \
+            libgirepository1.0-dev gir1.2-webkit2-4.0
+
+      # ── Build ────────────────────────────────────────────────────────────────
+      - name: Build with PyInstaller
+        run: pyinstaller smart_video_rename.spec --clean
+
+      # ── Package Linux AppImage ───────────────────────────────────────────────
+      - name: Package AppImage (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          APPDIR=dist/SmartVideoRename.AppDir
+          mkdir -p "$APPDIR/usr/bin"
+          cp -r dist/SmartVideoRename/* "$APPDIR/usr/bin/"
+
+          cat > "$APPDIR/SmartVideoRename.desktop" <<'EOF'
+          [Desktop Entry]
+          Name=Smart Video Rename
+          Exec=SmartVideoRename
+          Icon=SmartVideoRename
+          Type=Application
+          Categories=Utility;AudioVideo;
+          EOF
+
+          printf '#!/bin/bash\nexec "$(dirname "$0")/usr/bin/SmartVideoRename" "$@"\n' \
+            > "$APPDIR/AppRun"
+          chmod +x "$APPDIR/AppRun"
+
+          wget -q -O appimagetool \
+            https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          ARCH=x86_64 ./appimagetool "$APPDIR" dist/SmartVideoRename-Linux.AppImage
+
+      # ── Package macOS DMG ────────────────────────────────────────────────────
+      - name: Package DMG (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          hdiutil create \
+            -volname "Smart Video Rename" \
+            -srcfolder "dist/SmartVideoRename.app" \
+            -ov -format UDZO \
+            "dist/SmartVideoRename-macOS.dmg"
+
+      # ── Package Windows installer ─────────────────────────────────────────────
+      - name: Package installer (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install innosetup --no-progress -y
+          iscc scripts\installer.iss
+
+      # ── Upload artifact ──────────────────────────────────────────────────────
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ matrix.artifact }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
