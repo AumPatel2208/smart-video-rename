@@ -16,19 +16,36 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 import time
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from dotenv import load_dotenv
 from google import genai
 from pydantic import BaseModel, Field
 
-# Load environment variables from .env file
 load_dotenv()
+
+# Routing all output through _log lets callers (GUI or CLI) capture progress messages.
+# GUI sets this to its own callback via run_processing(on_progress=...); CLI keeps print.
+_log: Callable = print
+
+
+def _ffmpeg_bin(name: str) -> str:
+    """Return the path to an ffmpeg binary.
+
+    When running inside a PyInstaller bundle the vendored binaries live in
+    sys._MEIPASS/bin/.  Otherwise we fall back to whatever is on PATH.
+    """
+    if getattr(sys, 'frozen', False):
+        bundled = Path(sys._MEIPASS) / 'bin' / name  # type: ignore[attr-defined]
+        if bundled.exists():
+            return str(bundled)
+    return name  # rely on PATH
 
 
 # ============ Data Models ============
@@ -92,7 +109,7 @@ class BackupLog(BaseModel):
 def get_video_duration(video_path: str) -> float:
     """Get video duration in seconds using ffprobe."""
     result = subprocess.run(
-        ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+        [_ffmpeg_bin('ffprobe'), '-v', 'error', '-show_entries', 'format=duration',
          '-of', 'default=noprint_wrappers=1:nokey=1', video_path],
         capture_output=True, text=True, check=True
     )
@@ -102,14 +119,14 @@ def get_video_duration(video_path: str) -> float:
 def get_video_metadata(video_path: str) -> OriginalMetadata:
     """Extract existing metadata from video using ffprobe."""
     result = subprocess.run(
-        ['ffprobe', '-v', 'error', '-show_entries',
+        [_ffmpeg_bin('ffprobe'), '-v', 'error', '-show_entries',
          'format_tags=title,description,comment,keywords',
          '-of', 'json', video_path],
         capture_output=True, text=True
     )
-    
+
     metadata = OriginalMetadata()
-    
+
     if result.returncode == 0:
         try:
             data = json.loads(result.stdout)
@@ -122,7 +139,7 @@ def get_video_metadata(video_path: str) -> OriginalMetadata:
             metadata.keywords = tags_lower.get('keywords')
         except (json.JSONDecodeError, KeyError):
             pass
-    
+
     return metadata
 
 
@@ -131,14 +148,14 @@ def create_proxy(input_path: str, output_path: str, max_size_mb: float = 20.0) -
     try:
         duration = get_video_duration(input_path)
     except subprocess.CalledProcessError:
-        print(f"    Warning: Could not get duration, using default bitrate")
+        _log(f"    Warning: Could not get duration, using default bitrate")
         duration = 300  # Assume 5 minutes if we can't get duration
-    
+
     # Calculate bitrate for target size (leave room for audio)
     audio_bitrate = 64  # kbps
     target_bitrate = int((max_size_mb * 8 * 1024) / duration) - audio_bitrate
     target_bitrate = max(target_bitrate, 100)  # Minimum bitrate
-    
+
     # FFmpeg command breakdown:
     #   -y                    : Overwrite output file without asking
     #   -i input_path         : Input video file
@@ -150,7 +167,7 @@ def create_proxy(input_path: str, output_path: str, max_size_mb: float = 20.0) -
     #   -b:a 64k              : Audio bitrate 64kbps
     #   -movflags +faststart  : Move metadata to start for faster streaming/upload
     result = subprocess.run([
-        'ffmpeg', '-y', '-i', input_path,
+        _ffmpeg_bin('ffmpeg'), '-y', '-i', input_path,
         '-vf', 'scale=-2:360',
         '-c:v', 'libx264', '-preset', 'fast',
         '-b:v', f'{target_bitrate}k',
@@ -158,16 +175,16 @@ def create_proxy(input_path: str, output_path: str, max_size_mb: float = 20.0) -
         '-movflags', '+faststart',
         output_path
     ], capture_output=True, text=True)
-    
+
     if result.returncode != 0:
-        print(f"    FFmpeg error: {result.stderr[:500]}")
+        _log(f"    FFmpeg error: {result.stderr[:500]}")
         return False
-    
+
     # Verify file size
     actual_size = os.path.getsize(output_path) / (1024 * 1024)
     if actual_size > max_size_mb:
-        print(f"    Warning: Proxy is {actual_size:.1f}MB (target was {max_size_mb}MB)")
-    
+        _log(f"    Warning: Proxy is {actual_size:.1f}MB (target was {max_size_mb}MB)")
+
     return True
 
 
@@ -175,9 +192,9 @@ def write_metadata(input_path: str, output_path: str,
                    title: str, description: str, tags: List[str]) -> bool:
     """Write metadata to video file using ffmpeg (stream copy, no re-encode)."""
     keywords = ', '.join(tags)
-    
+
     result = subprocess.run([
-        'ffmpeg', '-y', '-i', input_path,
+        _ffmpeg_bin('ffmpeg'), '-y', '-i', input_path,
         '-c', 'copy',
         '-movflags', 'use_metadata_tags',
         '-metadata', f'title={title}',
@@ -186,14 +203,14 @@ def write_metadata(input_path: str, output_path: str,
         '-metadata', f'keywords={keywords}',
         output_path
     ], capture_output=True, text=True)
-    
+
     return result.returncode == 0
 
 
 def extract_audio(video_path: str, output_path: str) -> bool:
     """Extract audio from video file using ffmpeg."""
     result = subprocess.run([
-        'ffmpeg', '-y', '-i', video_path,
+        _ffmpeg_bin('ffmpeg'), '-y', '-i', video_path,
         '-vn',  # No video
         '-acodec', 'pcm_s16le',  # WAV format for Whisper
         '-ar', '16000',  # 16kHz sample rate (optimal for Whisper)
@@ -206,7 +223,7 @@ def extract_audio(video_path: str, output_path: str) -> bool:
 def transcribe_audio(audio_path: str) -> str:
     """Transcribe audio using OpenAI Whisper."""
     import whisper
-    
+
     model = whisper.load_model("turbo")
     result = model.transcribe(audio_path)
     return result["text"]
@@ -214,18 +231,17 @@ def transcribe_audio(audio_path: str) -> str:
 
 def extract_frames(video_path: str, output_dir: str, num_frames: int = 32) -> List[str]:
     """Extract evenly spaced frames from video.
-    
+
     Args:
         video_path: Path to input video
         output_dir: Directory to save frames
         num_frames: Number of frames to extract (default 32)
-        
+
     Returns:
         List of paths to extracted frame images
     """
-    # Get video duration
     duration = get_video_duration(video_path)
-    
+
     # Calculate frame interval
     # We want frames at: 0, duration/(n-1), 2*duration/(n-1), ..., duration
     if num_frames <= 1:
@@ -233,31 +249,27 @@ def extract_frames(video_path: str, output_dir: str, num_frames: int = 32) -> Li
     else:
         interval = duration / (num_frames - 1)
         fps_filter = f"fps=1/{interval}"
-    
-    # Create output pattern
+
     output_pattern = os.path.join(output_dir, "frame_%04d.jpg")
-    
-    # Extract frames using ffmpeg
-    # -vf fps=1/interval extracts one frame every 'interval' seconds
+
     result = subprocess.run([
-        'ffmpeg', '-y', '-i', video_path,
+        _ffmpeg_bin('ffmpeg'), '-y', '-i', video_path,
         '-vf', f"{fps_filter},scale=512:-1",  # Scale to 512px width for efficiency
         '-vframes', str(num_frames),
         '-q:v', '2',  # High quality JPEG
         output_pattern
     ], capture_output=True, text=True)
-    
+
     if result.returncode != 0:
-        print(f"    FFmpeg frame extraction error: {result.stderr[:500]}")
+        _log(f"    FFmpeg frame extraction error: {result.stderr[:500]}")
         return []
-    
-    # Collect extracted frame paths
+
     frame_paths = sorted([
-        os.path.join(output_dir, f) 
-        for f in os.listdir(output_dir) 
+        os.path.join(output_dir, f)
+        for f in os.listdir(output_dir)
         if f.startswith("frame_") and f.endswith(".jpg")
     ])
-    
+
     return frame_paths[:num_frames]  # Ensure we don't return more than requested
 
 
@@ -265,34 +277,34 @@ def restore_metadata(input_path: str, output_path: str,
                      metadata: OriginalMetadata) -> bool:
     """Restore original metadata to video file."""
     cmd = [
-        'ffmpeg', '-y', '-i', input_path,
+        _ffmpeg_bin('ffmpeg'), '-y', '-i', input_path,
         '-c', 'copy',
         '-movflags', 'use_metadata_tags',
     ]
-    
+
     # Only set metadata fields that were originally present
     if metadata.title:
         cmd.extend(['-metadata', f'title={metadata.title}'])
     else:
         cmd.extend(['-metadata', 'title='])
-    
+
     if metadata.description:
         cmd.extend(['-metadata', f'description={metadata.description}'])
     else:
         cmd.extend(['-metadata', 'description='])
-    
+
     if metadata.comment:
         cmd.extend(['-metadata', f'comment={metadata.comment}'])
     else:
         cmd.extend(['-metadata', 'comment='])
-    
+
     if metadata.keywords:
         cmd.extend(['-metadata', f'keywords={metadata.keywords}'])
     else:
         cmd.extend(['-metadata', 'keywords='])
-    
+
     cmd.append(output_path)
-    
+
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result.returncode == 0
 
@@ -302,14 +314,13 @@ def restore_metadata(input_path: str, output_path: str,
 def analyze_video(proxy_path: str, client: genai.Client, detect_slate: bool = False) -> VideoMetadata:
     """Analyze video with Gemini and return structured metadata."""
     uploaded_file = client.files.upload(file=proxy_path)
-    
+
     while uploaded_file.state == "PROCESSING":
-        print(f'  Waiting for video to be processed. {uploaded_file.name}:{uploaded_file.state}')
+        _log(f'  Waiting for video to be processed. {uploaded_file.name}:{uploaded_file.state}')
         time.sleep(5)
-        print()
-        uploaded_file = client.files.get(name=uploaded_file.name) 
-    
-    # Base prompt for video analysis
+        _log('')
+        uploaded_file = client.files.get(name=uploaded_file.name)
+
     prompt = """Analyze this video and provide metadata for organizing it.
 
 Based on the video content, provide:
@@ -328,8 +339,7 @@ Based on the video content, provide:
    - Category (travel, family, sports, tutorial, etc.)
    - Any notable people, objects, or events
 """
-    
-    # Add slate detection instructions if enabled
+
     if detect_slate:
         prompt += """
 4. scene: Look at the first few seconds of the video for a slate/clapperboard.
@@ -344,13 +354,12 @@ Based on the video content, provide:
    - Extract the Take number
    - If no slate is visible, set to null
 """
-    
+
     prompt += "\nRespond with valid JSON only."
 
-    # Retry logic for 503 UNAVAILABLE errors
     max_retries = 3
     retry_delay = 15  # seconds
-    
+
     for attempt in range(max_retries):
         try:
             response = client.models.generate_content(
@@ -361,33 +370,29 @@ Based on the video content, provide:
                     "response_schema": VideoMetadata,
                 },
             )
-            
-            # Clean up uploaded file
+
             try:
                 client.files.delete(name=uploaded_file.name)
             except Exception:
                 pass
-            
+
             return VideoMetadata.model_validate_json(response.text)
-            
+
         except Exception as e:
             error_str = str(e)
-            # Check if it's a 503 UNAVAILABLE error
             if '503' in error_str and 'UNAVAILABLE' in error_str:
                 if attempt < max_retries - 1:
-                    print(f"  Model overloaded, waiting {retry_delay} seconds before retry {attempt + 2}/{max_retries}...")
+                    _log(f"  Model overloaded, waiting {retry_delay} seconds before retry {attempt + 2}/{max_retries}...")
                     time.sleep(retry_delay)
                     continue
                 else:
-                    print(f"  Max retries reached. Model still overloaded.")
-                    # Clean up uploaded file before raising
+                    _log(f"  Max retries reached. Model still overloaded.")
                     try:
                         client.files.delete(name=uploaded_file.name)
                     except Exception:
                         pass
                     raise
             else:
-                # For other errors, clean up and raise immediately
                 try:
                     client.files.delete(name=uploaded_file.name)
                 except Exception:
@@ -395,62 +400,57 @@ Based on the video content, provide:
                 raise
 
 
-def analyze_video_with_frames(video_path: str, client: genai.Client, 
+def analyze_video_with_frames(video_path: str, client: genai.Client,
                                detect_slate: bool = False,
                                num_frames: int = 32) -> VideoMetadata:
     """Analyze video using extracted frames and audio transcription (for Gemma model).
-    
+
     This function:
     1. Extracts audio and transcribes it with Whisper
     2. Extracts evenly-spaced frames from the video
     3. Sends frames + transcription to Gemma for analysis
-    
+
     Args:
         video_path: Path to the video file (can be original or proxy)
         client: Gemini API client
         detect_slate: Whether to detect slate/clapperboard info
         num_frames: Number of frames to extract (default 32, max for Gemma)
-        
+
     Returns:
         VideoMetadata with AI-generated metadata
     """
     from PIL import Image
-    
-    # Create temp directory for frames and audio
+
     with tempfile.TemporaryDirectory() as temp_dir:
-        # Extract and transcribe audio
-        print("  Extracting audio for transcription...")
+        _log("  Extracting audio for transcription...")
         audio_path = os.path.join(temp_dir, "audio.wav")
         transcription = ""
-        
+
         if extract_audio(video_path, audio_path):
-            print("  Transcribing audio with Whisper...")
+            _log("  Transcribing audio with Whisper...")
             try:
                 transcription = transcribe_audio(audio_path)
                 if transcription:
-                    print(f"  Transcription: {transcription[:100]}...")
+                    _log(f"  Transcription: {transcription[:100]}...")
             except Exception as e:
-                print(f"  Warning: Audio transcription failed: {e}")
+                _log(f"  Warning: Audio transcription failed: {e}")
                 transcription = ""
         else:
-            print("  Warning: Could not extract audio (video may be silent)")
-        
-        # Extract frames
-        print(f"  Extracting {num_frames} frames...")
+            _log("  Warning: Could not extract audio (video may be silent)")
+
+        _log(f"  Extracting {num_frames} frames...")
         frame_paths = extract_frames(video_path, temp_dir, num_frames)
-        
+
         if not frame_paths:
             raise ValueError("Failed to extract frames from video")
-        
-        print(f"  Extracted {len(frame_paths)} frames")
-        
-        # Load frames as PIL images for the API
+
+        _log(f"  Extracted {len(frame_paths)} frames")
+
         frames = []
         for frame_path in frame_paths:
             img = Image.open(frame_path)
             frames.append(img)
-        
-        # Build the prompt
+
         prompt = """Analyze these video frames and audio transcription to provide metadata for organizing this video.
 
 """
@@ -459,7 +459,7 @@ def analyze_video_with_frames(video_path: str, client: genai.Client,
 {transcription}
 
 """
-        
+
         prompt += """Based on the video frames and audio, provide:
 1. filename: A descriptive, filesystem-safe filename
    - Use lowercase letters, numbers, and underscores only
@@ -476,8 +476,7 @@ def analyze_video_with_frames(video_path: str, client: genai.Client,
    - Category (travel, family, sports, tutorial, etc.)
    - Any notable people, objects, or events
 """
-        
-        # Add slate detection instructions if enabled
+
         if detect_slate:
             prompt += """
 4. scene: Look at the first few frames for a slate/clapperboard.
@@ -492,39 +491,32 @@ def analyze_video_with_frames(video_path: str, client: genai.Client,
    - Extract the Take number
    - If no slate is visible, set to null
 """
-        
+
         prompt += "\nRespond with valid JSON only."
-        
-        # Build content list: frames + prompt
+
         contents = frames + [prompt]
-        
-        # Retry logic for 503 UNAVAILABLE errors
+
         max_retries = 3
         retry_delay = 15  # seconds
-        
+
         for attempt in range(max_retries):
             try:
                 response = client.models.generate_content(
                     model="gemma-3-27b-it",
                     contents=contents,
-                    # config={
-                    #     "response_mime_type": "application/json",
-                    #     "response_schema": VideoMetadata,
-                    # },
                 )
                 fixed_response = response.text.replace("```json", "").replace("```", "").strip()
                 return VideoMetadata.model_validate_json(fixed_response)
-                
+
             except Exception as e:
                 error_str = str(e)
-                # Check if it's a 503 UNAVAILABLE error
                 if '503' in error_str and 'UNAVAILABLE' in error_str:
                     if attempt < max_retries - 1:
-                        print(f"  Model overloaded, waiting {retry_delay} seconds before retry {attempt + 2}/{max_retries}...")
+                        _log(f"  Model overloaded, waiting {retry_delay} seconds before retry {attempt + 2}/{max_retries}...")
                         time.sleep(retry_delay)
                         continue
                     else:
-                        print(f"  Max retries reached. Model still overloaded.")
+                        _log(f"  Max retries reached. Model still overloaded.")
                         raise
                 else:
                     raise
@@ -554,54 +546,49 @@ def load_backup(backup_path: Path) -> BackupLog:
 def restore_from_backup(backup_path: Path, dry_run: bool = False) -> None:
     """Restore videos to their original state from a backup file."""
     backup = load_backup(backup_path)
-    
-    print(f"Restoring from backup: {backup_path.name}")
-    print(f"Backup created at: {backup.created_at}")
-    print(f"Entries to restore: {len(backup.entries)}")
-    print()
-    
+
+    _log(f"Restoring from backup: {backup_path.name}")
+    _log(f"Backup created at: {backup.created_at}")
+    _log(f"Entries to restore: {len(backup.entries)}")
+    _log('')
+
     for entry in backup.entries:
         new_path = Path(entry.new_path)
         original_path = Path(entry.original_path)
-        
-        print(f"Restoring: {entry.new_filename} -> {entry.original_filename}")
-        
+
+        _log(f"Restoring: {entry.new_filename} -> {entry.original_filename}")
+
         if not new_path.exists():
-            print(f"  Warning: {new_path} not found, skipping")
+            _log(f"  Warning: {new_path} not found, skipping")
             continue
-        
+
         if dry_run:
-            print(f"  [DRY RUN] Would restore metadata and rename")
+            _log(f"  [DRY RUN] Would restore metadata and rename")
             continue
-        
-        # Create temp file with restored metadata
+
         with tempfile.NamedTemporaryFile(suffix=new_path.suffix, delete=False) as tmp:
             temp_path = tmp.name
-        
+
         try:
-            # Restore original metadata
             if restore_metadata(str(new_path), temp_path, entry.original_metadata):
-                # Move temp file to original path
                 shutil.move(temp_path, str(original_path))
-                # Remove the renamed file if it's different from original
                 if new_path != original_path and new_path.exists():
                     new_path.unlink()
-                print(f"  Restored successfully")
+                _log(f"  Restored successfully")
             else:
-                print(f"  Error: Failed to restore metadata")
+                _log(f"  Error: Failed to restore metadata")
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
         except Exception as e:
-            print(f"  Error: {e}")
+            _log(f"  Error: {e}")
             if os.path.exists(temp_path):
                 os.remove(temp_path)
-    
-    print("\nRestore complete!")
+
+    _log("\nRestore complete!")
 
 
 # ============ DaVinci Resolve CSV Export ============
 
-# CSV column order matching DaVinci Resolve metadata format
 DAVINCI_CSV_COLUMNS = [
     'File Name',
     'Comments',
@@ -628,45 +615,30 @@ def format_date_modified(file_path: Path) -> str:
 
 
 def append_to_davinci_csv(entry: VideoBackupEntry, csv_path: Path, dry_run: bool = False) -> bool:
-    """Append a single entry to DaVinci Resolve CSV, creating file if needed.
-    
-    Args:
-        entry: Single VideoBackupEntry to append
-        csv_path: Path to CSV file
-        dry_run: If True, use backup timestamps instead of actual file stats
-        
-    Returns:
-        True if append was successful, False otherwise
-    """
+    """Append a single entry to DaVinci Resolve CSV, creating file if needed."""
     try:
-        # Check if file exists to determine if we need to write header
         file_exists = csv_path.exists()
-        
+
         with open(csv_path, 'a', newline='', encoding='utf-8') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=DAVINCI_CSV_COLUMNS)
-            
-            # Write header if file is new
+
             if not file_exists:
                 writer.writeheader()
-            
+
             new_path = Path(entry.new_path)
-            
-            # Format comments as "Description: <desc>\nTags: <tags>"
+
             tags_str = ', '.join(entry.new_metadata.tags)
             comments = f"Description: {entry.new_metadata.description}\nTags: {tags_str}"
-            
-            # Get date modified from file or use processed_at timestamp
+
             if not dry_run and new_path.exists():
                 date_modified = format_date_modified(new_path)
             else:
-                # Use processed_at timestamp for dry run
                 try:
                     dt = datetime.fromisoformat(entry.processed_at)
                     date_modified = dt.strftime("%a %b %d %H:%M:%S %Y")
                 except ValueError:
                     date_modified = ""
-            
-            # Build row with all columns (technical fields empty, slate from metadata)
+
             row = {
                 'File Name': entry.new_filename,
                 'Comments': comments,
@@ -675,53 +647,39 @@ def append_to_davinci_csv(entry: VideoBackupEntry, csv_path: Path, dry_run: bool
                 'Take': entry.new_metadata.take or '',
             }
             writer.writerow(row)
-        
+
         return True
     except Exception as e:
-        print(f"  Warning: Failed to update CSV: {e}")
+        _log(f"  Warning: Failed to update CSV: {e}")
         return False
 
 
 def export_davinci_csv(backup: BackupLog, csv_path: Path, dry_run: bool = False) -> bool:
-    """Export backup entries to DaVinci Resolve compatible CSV.
-    
-    Args:
-        backup: BackupLog containing processed video entries
-        csv_path: Path to write CSV file
-        dry_run: If True, use backup timestamps instead of actual file stats
-        
-    Returns:
-        True if export was successful, False otherwise
-    """
+    """Export backup entries to DaVinci Resolve compatible CSV."""
     if not backup.entries:
-        print("No entries to export to CSV")
+        _log("No entries to export to CSV")
         return False
-    
+
     try:
         with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=DAVINCI_CSV_COLUMNS)
             writer.writeheader()
-            
+
             for entry in backup.entries:
                 new_path = Path(entry.new_path)
-                clip_directory = str(new_path.parent)
-                
-                # Format comments as "Description: <desc>\nTags: <tags>"
+
                 tags_str = ', '.join(entry.new_metadata.tags)
                 comments = f"Description: {entry.new_metadata.description}\nTags: {tags_str}"
-                
-                # Get date modified from file or use processed_at timestamp
+
                 if not dry_run and new_path.exists():
                     date_modified = format_date_modified(new_path)
                 else:
-                    # Use processed_at timestamp for dry run
                     try:
                         dt = datetime.fromisoformat(entry.processed_at)
                         date_modified = dt.strftime("%a %b %d %H:%M:%S %Y")
                     except ValueError:
                         date_modified = ""
-                
-                # Build row with all columns (technical fields empty, slate from metadata)
+
                 row = {
                     'File Name': entry.new_filename,
                     'Comments': comments,
@@ -730,99 +688,80 @@ def export_davinci_csv(backup: BackupLog, csv_path: Path, dry_run: bool = False)
                     'Take': entry.new_metadata.take or '',
                 }
                 writer.writerow(row)
-        
+
         return True
     except Exception as e:
-        print(f"Error exporting CSV: {e}")
+        _log(f"Error exporting CSV: {e}")
         return False
 
 
 # ============ Video Processing ============
 
-def process_single_video(video_path: Path, output_dir: Path, 
+def process_single_video(video_path: Path, output_dir: Path,
                          client: genai.Client, dry_run: bool = False,
                          max_proxy_size: float = 20.0,
                          detect_slate: bool = False,
                          csv_path: Optional[Path] = None,
                          model: str = 'gemini-2.5-flash') -> Optional[VideoBackupEntry]:
-    """Process a single video file and return backup entry.
-    
-    Args:
-        video_path: Path to the video file
-        output_dir: Directory for output files
-        client: Gemini API client
-        dry_run: If True, don't apply changes
-        max_proxy_size: Maximum proxy file size in MB
-        detect_slate: Whether to detect slate/clapperboard info
-        csv_path: Path to CSV file for DaVinci Resolve export
-        model: AI model to use ('gemini-2.5-flash' or 'gemma-3-27b-it')
-    """
-    print(f"\nProcessing: {video_path.name}")
-    print(f"  Using model: {model}")
-    
-    # Get original metadata
-    print("  Reading original metadata...")
+    """Process a single video file and return backup entry."""
+    _log(f"\nProcessing: {video_path.name}")
+    _log(f"  Using model: {model}")
+
+    _log("  Reading original metadata...")
     original_metadata = get_video_metadata(str(video_path))
-    
-    # For Gemma model, we use the original video for frame extraction
-    # For Gemini, we create a proxy
+
     use_gemma = model == 'gemma-3-27b-it'
-    
+
     if use_gemma:
-        # Gemma model: use original video for frame extraction and audio
-        print("  Analyzing with Gemma (frames + audio transcription)...")
+        _log("  Analyzing with Gemma (frames + audio transcription)...")
         if detect_slate:
-            print("  (Slate detection enabled)")
+            _log("  (Slate detection enabled)")
         try:
             new_metadata = analyze_video_with_frames(str(video_path), client, detect_slate)
         except Exception as e:
-            print(f"  Error analyzing video: {e}")
+            _log(f"  Error analyzing video: {e}")
             return None
     else:
-        # Gemini model: create proxy and upload whole video
         with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
             proxy_path = tmp.name
-        
+
         try:
-            print("  Creating 360p proxy...")
+            _log("  Creating 360p proxy...")
             if not create_proxy(str(video_path), proxy_path, max_proxy_size):
-                print("  Error: Failed to create proxy")
+                _log("  Error: Failed to create proxy")
                 return None
-            
+
             proxy_size = os.path.getsize(proxy_path) / (1024 * 1024)
-            print(f"  Proxy size: {proxy_size:.1f}MB")
-            
-            # Analyze with AI
-            print("  Analyzing with Gemini (full video)...")
+            _log(f"  Proxy size: {proxy_size:.1f}MB")
+
+            _log("  Analyzing with Gemini (full video)...")
             if detect_slate:
-                print("  (Slate detection enabled)")
+                _log("  (Slate detection enabled)")
             try:
                 new_metadata = analyze_video(proxy_path, client, detect_slate)
             except Exception as e:
-                print(f"  Error analyzing video: {e}")
+                _log(f"  Error analyzing video: {e}")
                 return None
         finally:
-            # Cleanup proxy
             if os.path.exists(proxy_path):
                 os.remove(proxy_path)
-        
-    print(f"  Suggested filename: {new_metadata.filename}")
-    print(f"  Description: {new_metadata.description}")
-    print(f"  Tags: {', '.join(new_metadata.tags)}")
-    
-    # Create new filename
+
+    _log(f"  Suggested filename: {new_metadata.filename}")
+    _log(f"  Description: {new_metadata.description}")
+    _log(f"  Tags: {', '.join(new_metadata.tags)}")
+
     new_filename = f"{new_metadata.filename}{video_path.suffix.lower()}"
     new_path = output_dir / new_filename
-    
+
     # Handle duplicates
     counter = 1
     while new_path.exists() and new_path != video_path:
         new_filename = f"{new_metadata.filename}_{counter}{video_path.suffix.lower()}"
         new_path = output_dir / new_filename
         counter += 1
-    
+
     if dry_run:
-        print(f"  [DRY RUN] Would rename to: {new_filename}")
+        _log(f"  [DRY RUN] Would rename to: {new_filename}")
         entry = VideoBackupEntry(
             original_path=str(video_path),
             original_filename=video_path.name,
@@ -832,28 +771,24 @@ def process_single_video(video_path: Path, output_dir: Path,
             new_metadata=new_metadata,
             processed_at=datetime.now().isoformat()
         )
-        # Update CSV immediately after processing
         if csv_path:
             append_to_davinci_csv(entry, csv_path, dry_run)
         return entry
-    
-    # Write metadata to temp file and move
-    print(f"  Writing metadata...")
+
+    _log(f"  Writing metadata...")
     with tempfile.NamedTemporaryFile(suffix=video_path.suffix, delete=False) as tmp_out:
         temp_output = tmp_out.name
-    
+
     try:
         if write_metadata(str(video_path), temp_output,
                          new_metadata.filename, new_metadata.description, new_metadata.tags):
-            # Move to final destination
             shutil.move(temp_output, str(new_path))
-            
-            # Remove original if different from new path
+
             if video_path != new_path and video_path.exists():
                 video_path.unlink()
-            
-            print(f"  Renamed to: {new_filename}")
-            
+
+            _log(f"  Renamed to: {new_filename}")
+
             entry = VideoBackupEntry(
                 original_path=str(video_path),
                 original_filename=video_path.name,
@@ -863,12 +798,11 @@ def process_single_video(video_path: Path, output_dir: Path,
                 new_metadata=new_metadata,
                 processed_at=datetime.now().isoformat()
             )
-            # Update CSV immediately after processing
             if csv_path:
                 append_to_davinci_csv(entry, csv_path, dry_run)
             return entry
         else:
-            print("  Error: Failed to write metadata")
+            _log("  Error: Failed to write metadata")
             return None
     finally:
         if os.path.exists(temp_output):
@@ -884,19 +818,19 @@ def process_videos(video_files: List[Path], output_dir: Path,
                    model: str = 'gemini-2.5-flash') -> List[VideoBackupEntry]:
     """Process multiple videos, optionally in parallel."""
     entries = []
-    
+
     if parallel and len(video_files) > 1:
-        print(f"\nProcessing {len(video_files)} videos in parallel (max {max_workers} workers)...")
-        
+        _log(f"\nProcessing {len(video_files)} videos in parallel (max {max_workers} workers)...")
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
                 executor.submit(
-                    process_single_video, video_path, output_dir, 
+                    process_single_video, video_path, output_dir,
                     client, dry_run, max_proxy_size, detect_slate, csv_path, model
                 ): video_path
                 for video_path in video_files
             }
-            
+
             for future in as_completed(futures):
                 video_path = futures[future]
                 try:
@@ -904,18 +838,18 @@ def process_videos(video_files: List[Path], output_dir: Path,
                     if entry:
                         entries.append(entry)
                 except Exception as e:
-                    print(f"Error processing {video_path.name}: {e}")
+                    _log(f"Error processing {video_path.name}: {e}")
     else:
         for video_path in video_files:
-            entry = process_single_video(video_path, output_dir, client, 
+            entry = process_single_video(video_path, output_dir, client,
                                          dry_run, max_proxy_size, detect_slate, csv_path, model)
             if entry:
                 entries.append(entry)
-    
+
     return entries
 
 
-# ============ CLI ============
+# ============ Public API (used by GUI and CLI) ============
 
 def get_video_files(directory: Path, extensions: List[str]) -> List[Path]:
     """Get all video files in directory."""
@@ -925,6 +859,148 @@ def get_video_files(directory: Path, extensions: List[str]) -> List[Path]:
         video_files.extend(directory.glob(f'*{ext.upper()}'))
     return sorted(set(video_files))
 
+
+DEFAULT_EXTENSIONS = ['.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v']
+
+
+def run_processing(
+    directory: str,
+    *,
+    api_key: Optional[str] = None,
+    dry_run: bool = False,
+    output_dir: Optional[str] = None,
+    extensions: Optional[List[str]] = None,
+    parallel: bool = False,
+    workers: int = 4,
+    max_proxy_size: float = 20.0,
+    detect_slate: bool = False,
+    model: str = 'gemma-3-27b-it',
+    on_progress: Optional[Callable] = None,
+) -> dict:
+    """Process videos in a directory.
+
+    Args:
+        directory: Path to directory containing videos.
+        api_key: Google API key. If None, reads GOOGLE_API_KEY from env/.env.
+        dry_run: Preview changes without writing anything.
+        output_dir: Where to write renamed files. Defaults to input directory.
+        extensions: Video extensions to scan. Defaults to DEFAULT_EXTENSIONS.
+        parallel: Process videos concurrently.
+        workers: Thread count when parallel=True.
+        max_proxy_size: Proxy size cap in MB (Gemini model only).
+        detect_slate: Extract scene/shot/take from clapperboard.
+        model: 'gemini-2.5-flash' or 'gemma-3-27b-it'.
+        on_progress: Callable(str) that receives log messages. Defaults to print.
+
+    Returns:
+        dict with keys: processed, total, backup_path, csv_path, entries.
+
+    Raises:
+        ValueError: If directory is invalid.
+    """
+    global _log
+    _log = on_progress or print
+
+    if api_key:
+        os.environ['GOOGLE_API_KEY'] = api_key
+
+    input_dir = Path(directory)
+    if not input_dir.is_dir():
+        raise ValueError(f"'{directory}' is not a valid directory")
+
+    out_dir = Path(output_dir) if output_dir else input_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    exts = extensions or DEFAULT_EXTENSIONS
+    video_files = get_video_files(input_dir, exts)
+
+    if not video_files:
+        _log(f"No video files found in {input_dir}")
+        return {'processed': 0, 'total': 0, 'backup_path': None, 'csv_path': None, 'entries': []}
+
+    _log(f"Found {len(video_files)} video file(s)")
+    for vf in video_files:
+        _log(f"  - {vf.name}")
+
+    _log("\nInitializing Gemini AI client...")
+    client = genai.Client()
+
+    backup = BackupLog(
+        created_at=datetime.now().isoformat(),
+        source_directory=str(input_dir),
+        detect_slate=detect_slate,
+    )
+
+    csv_path = create_davinci_csv_filename(out_dir)
+
+    entries = process_videos(
+        video_files, out_dir, client,
+        dry_run=dry_run,
+        parallel=parallel,
+        max_workers=workers,
+        max_proxy_size=max_proxy_size,
+        detect_slate=detect_slate,
+        csv_path=csv_path,
+        model=model,
+    )
+
+    backup.entries = entries
+
+    backup_path_result = None
+    csv_path_result = None
+
+    if entries:
+        backup_path_obj = create_backup_filename(input_dir)
+        save_backup(backup, backup_path_obj)
+        _log(f"\nBackup saved to: {backup_path_obj.name}")
+        _log(f"To restore: python video_rename.py --restore {backup_path_obj}")
+        backup_path_result = str(backup_path_obj)
+
+        if csv_path.exists():
+            _log(f"DaVinci CSV saved to: {csv_path.name}")
+            csv_path_result = str(csv_path)
+
+    _log(f"\nProcessed {len(entries)}/{len(video_files)} video(s) successfully")
+
+    if dry_run:
+        _log("\n[DRY RUN] No changes were made. Run without --dry-run to apply changes.")
+
+    return {
+        'processed': len(entries),
+        'total': len(video_files),
+        'backup_path': backup_path_result,
+        'csv_path': csv_path_result,
+        'entries': entries,
+    }
+
+
+def run_restore(
+    backup_path: str,
+    *,
+    dry_run: bool = False,
+    on_progress: Optional[Callable] = None,
+) -> None:
+    """Restore videos from a backup JSON file.
+
+    Args:
+        backup_path: Path to the backup JSON file.
+        dry_run: Preview restore without writing anything.
+        on_progress: Callable(str) that receives log messages. Defaults to print.
+
+    Raises:
+        FileNotFoundError: If backup_path does not exist.
+    """
+    global _log
+    _log = on_progress or print
+
+    path = Path(backup_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Backup file not found: {backup_path}")
+
+    restore_from_backup(path, dry_run)
+
+
+# ============ CLI ============
 
 def parse_arguments() -> argparse.Namespace:
     """Parse command line arguments."""
@@ -944,74 +1020,67 @@ Output:
   - DaVinci Resolve compatible CSV with metadata
         '''
     )
-    
-    # Main arguments
+
     parser.add_argument(
         'directory',
         nargs='?',
         type=str,
         help='Directory containing video files to process'
     )
-    
-    # Restore mode
+
     parser.add_argument(
         '--restore', '-r',
         type=str,
         metavar='BACKUP_FILE',
         help='Restore videos from a backup JSON file'
     )
-    
-    # Processing options
+
     parser.add_argument(
         '--dry-run', '-n',
         action='store_true',
         help='Preview changes without applying them'
     )
-    
+
     parser.add_argument(
         '--output-dir', '-o',
         type=str,
         default=None,
         help='Output directory for renamed videos (default: same as input)'
     )
-    
+
     parser.add_argument(
         '--extensions', '-e',
         nargs='+',
-        default=['.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v'],
+        default=DEFAULT_EXTENSIONS,
         help='Video file extensions to process (default: .mp4 .mov .avi .mkv .webm .m4v)'
     )
-    
-    # Parallel processing
+
     parser.add_argument(
         '--parallel', '-p',
         action='store_true',
         help='Enable parallel processing of videos'
     )
-    
+
     parser.add_argument(
         '--workers', '-w',
         type=int,
         default=4,
         help='Number of parallel workers (default: 4, only used with --parallel)'
     )
-    
-    # Proxy settings
+
     parser.add_argument(
         '--max-proxy-size', '-s',
         type=float,
         default=20.0,
         help='Maximum proxy file size in MB (default: 20)'
     )
-    
-    # Slate detection
+
     parser.add_argument(
         '--detect-slate',
         action='store_true',
         help='Enable slate/clapperboard detection for Scene, Shot, Take fields'
     )
-    
-    # Model selection
+
     parser.add_argument(
         '--model', '-m',
         type=str,
@@ -1019,91 +1088,42 @@ Output:
         default='gemma-3-27b-it',
         help='AI model to use: gemini-2.5-flash (full video, only 20 requests per day) or gemma-3-27b-it (32 frames + audio transcription, 14.4k requests per day). Default: gemma-3-27b-it'
     )
-    
+
     return parser.parse_args()
 
 
 def main():
-    """Main entry point."""
+    """CLI entry point."""
     args = parse_arguments()
-    
-    # Restore mode
+
     if args.restore:
-        backup_path = Path(args.restore)
-        if not backup_path.exists():
-            print(f"Error: Backup file not found: {args.restore}")
+        try:
+            run_restore(args.restore, dry_run=args.dry_run)
+        except FileNotFoundError as e:
+            print(f"Error: {e}")
             return 1
-        restore_from_backup(backup_path, args.dry_run)
         return 0
-    
-    # Process mode requires directory
+
     if not args.directory:
         print("Error: Please provide a directory or use --restore")
         return 1
-    
-    input_dir = Path(args.directory)
-    if not input_dir.is_dir():
-        print(f"Error: '{args.directory}' is not a valid directory")
+
+    try:
+        run_processing(
+            args.directory,
+            dry_run=args.dry_run,
+            output_dir=args.output_dir,
+            extensions=args.extensions,
+            parallel=args.parallel,
+            workers=args.workers,
+            max_proxy_size=args.max_proxy_size,
+            detect_slate=args.detect_slate,
+            model=args.model,
+        )
+    except ValueError as e:
+        print(f"Error: {e}")
         return 1
-    
-    output_dir = Path(args.output_dir) if args.output_dir else input_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Find video files
-    video_files = get_video_files(input_dir, args.extensions)
-    
-    if not video_files:
-        print(f"No video files found in {input_dir}")
-        return 0
-    
-    print(f"Found {len(video_files)} video file(s)")
-    for vf in video_files:
-        print(f"  - {vf.name}")
-    
-    # Initialize Gemini client
-    print("\nInitializing Gemini AI client...")
-    client = genai.Client()
-    
-    # Create backup log
-    backup = BackupLog(
-        created_at=datetime.now().isoformat(),
-        source_directory=str(input_dir),
-        detect_slate=args.detect_slate
-    )
-    
-    # Create CSV path upfront
-    csv_path = create_davinci_csv_filename(output_dir)
-    
-    # Process videos (CSV updated incrementally during processing)
-    entries = process_videos(
-        video_files, output_dir, client,
-        dry_run=args.dry_run,
-        parallel=args.parallel,
-        max_workers=args.workers,
-        max_proxy_size=args.max_proxy_size,
-        detect_slate=args.detect_slate,
-        csv_path=csv_path,
-        model=args.model
-    )
-    
-    backup.entries = entries
-    
-    # Save backup (even for dry run, so user can see what would happen)
-    if entries:
-        backup_path = create_backup_filename(input_dir)
-        save_backup(backup, backup_path)
-        print(f"\nBackup saved to: {backup_path.name}")
-        print(f"To restore: python video_rename.py --restore {backup_path}")
-        
-        # CSV was already updated incrementally during processing
-        if csv_path.exists():
-            print(f"DaVinci CSV saved to: {csv_path.name}")
-    
-    print(f"\nProcessed {len(entries)}/{len(video_files)} video(s) successfully")
-    
-    if args.dry_run:
-        print("\n[DRY RUN] No changes were made. Run without --dry-run to apply changes.")
-    
+
     return 0
 
 
