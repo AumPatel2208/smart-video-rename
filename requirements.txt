@@ -4,3 +4,4 @@ python-dotenv>=1.0.0
 openai-whisper>=20240930
 Pillow>=10.0.0
 nicegui[native]>=1.4.0
+pytest>=8.0.0
